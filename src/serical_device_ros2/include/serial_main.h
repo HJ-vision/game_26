@@ -5,7 +5,7 @@
 #include <thread>
 #include <vector>
 #include "serial_device.h"
-#include "protocol.h"
+#include "protocol_new.hpp"
 #include "crc.h"
 #include <memory> 
 class SerialMain {
@@ -26,7 +26,7 @@ public:
 	
 	uint16_t SenderPackSolve(uint8_t *data, uint16_t data_length,
 							 uint16_t cmd_id, uint8_t *send_buf);
-	vision_t vision_msg_;
+	io::VisionData vision_msg_;
 
 private:
 	
@@ -38,14 +38,15 @@ private:
 	const unsigned int BUFF_LENGTH = 512;
 	
 	//! Frame Information
-	frame_header_struct_t frame_receive_header_;
-	frame_header_struct_t frame_send_header_;
+	io::FrameHeader frame_receive_header_;
+	io::FrameHeader frame_send_header_;
+	uint8_t seq_counter_ = 0;
 	
 	/** @brief specific protocol data are defined here
-	 *         xxxx_info_t is defined in protocol.h
+	 *         xxxx_info_t is defined in
 	 */
 	
-	robot_ctrl_info_t robot_ctrl;
+	io::RobotCtrlData robot_ctrl;
 };
 //}
 

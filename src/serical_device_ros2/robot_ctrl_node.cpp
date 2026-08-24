@@ -27,9 +27,16 @@ private:
   // void robotCtrlSend(const auto_aim_interfaces::msg::RobotCtrl &msg) const 
   void robotCtrlSend(const auto_aim_interfaces::msg::RobotCtrl::ConstSharedPtr& msg)
   {
-    double fire = static_cast<double>(msg->fire_command);
-    double mode = static_cast<double>(msg->target_lock);
-    vdata = {msg->pitch, msg->yaw, fire, mode};
+    vdata = {
+      msg->yaw,
+      msg->yaw_vel,
+      msg->yaw_acc,
+      msg->pitch,
+      msg->pitch_vel,
+      msg->pitch_acc,
+      static_cast<double>(msg->target_lock),
+      static_cast<double>(msg->fire_command)
+    };
     serial.SenderMain(vdata);    
     // std::cout<<"---------- ROBOT CTRL SEND ----  "<<" yaw: "<<(double)msg->yaw<<std::endl;
   }
@@ -42,7 +49,7 @@ private:
 // }
 
   SerialMain serial;
-  std::vector<double> vdata{4};
+  std::vector<double> vdata = std::vector<double>(8, 0.0);
   rclcpp::Subscription<auto_aim_interfaces::msg::RobotCtrl>::SharedPtr subscription_;
 };
 

@@ -10,12 +10,16 @@ SerialMain::SerialMain(std::string device_path) : device_path_(device_path)
 
 void SerialMain::SenderMain(const std::vector<double> &vdata)
 {
-	robot_ctrl.pitch = vdata[0];
-	robot_ctrl.yaw = vdata[1];
-	robot_ctrl.fire_command = vdata[2];
-	robot_ctrl.target_lock = vdata[3];
-	uint16_t send_length = SenderPackSolve((uint8_t *)&robot_ctrl, sizeof(robot_ctrl_info_t),
-										   CHASSIS_CTRL_CMD_ID, send_buff_.get());
+	robot_ctrl.yaw = vdata[0];
+	robot_ctrl.yaw_vel = vdata[1];
+	robot_ctrl.yaw_acc = vdata[2];
+	robot_ctrl.pitch = vdata[3];
+	robot_ctrl.pitch_vel = vdata[4];
+	robot_ctrl.pitch_acc = vdata[5];
+	robot_ctrl.target_lock = vdata[6];
+	robot_ctrl.fire_command = vdata[7];
+	uint16_t send_length = SenderPackSolve((uint8_t *)&robot_ctrl, sizeof(io::RobotCtrlData),
+										   io::CHASSIS_CTRL_CMD_ID, send_buff_.get());
 	device_ptr_->Write(send_buff_.get(), send_length);
 	std::cout<<"robot"<<robot_ctrl.yaw<<"11"<<std::endl;
 }
@@ -33,8 +37,8 @@ bool SerialMain::CommInit()
 	recv_buff_ = std::unique_ptr<uint8_t[]>(new uint8_t[BUFF_LENGTH]);
 	send_buff_ = std::unique_ptr<uint8_t[]>(new uint8_t[BUFF_LENGTH]);
 	
-	memset(&frame_receive_header_, 0, sizeof(frame_header_struct_t));
-	memset(&frame_send_header_, 0, sizeof(frame_header_struct_t));
+	memset(&frame_receive_header_, 0, sizeof(io::FrameHeader));
+	memset(&frame_send_header_, 0, sizeof(io::FrameHeader));
 	
 	return true;
 }
@@ -51,11 +55,11 @@ bool SerialMain::ReceiverMain()
 	{
 		// uint16_t read_length = device_ptr_->Read(recv_buff_.get(),BUFF_LENGTH);
 		
-		last_len = device_ptr_->ReadUntil2(recv_buff_.get(), END1_SOF, END2_SOF, 128);
+		last_len = device_ptr_->ReadUntil2(recv_buff_.get(), io::END1_SOF, io::END2_SOF, 128);
 		
 		while (flag == 0 && last_len == 1)
 		{
-			if ((recv_buff_[a] == END1_SOF) && (recv_buff_[a + 1] == END2_SOF))
+			if ((recv_buff_[a] == io::END1_SOF) && (recv_buff_[a + 1] == io::END2_SOF))
 			{
 				flag = 1;
 				SearchFrameSOF(recv_buff_.get(), a);
@@ -79,7 +83,7 @@ void SerialMain::SearchFrameSOF(uint8_t *frame, uint16_t total_len)
 //	std::cout<<total_len<<std::endl;
 	for (i = 0; i < total_len;)
 	{
-		if (*frame == HEADER_SOF)
+		if (*frame == io::HEADER_SOF)
 		{
 			ReceiveDataSolve(frame);
 			i = total_len;
@@ -94,18 +98,18 @@ void SerialMain::SearchFrameSOF(uint8_t *frame, uint16_t total_len)
 
 uint16_t SerialMain::ReceiveDataSolve(uint8_t *frame)
 {
-	uint8_t index = 0;
+	uint16_t index = 0;
 	uint16_t cmd_id = 0;
 	
-	if (*frame != HEADER_SOF)
+	if (*frame != io::HEADER_SOF)
 	{
 		return 0;
 	}
 	
-	memcpy(&frame_receive_header_, frame, sizeof(frame_header_struct_t));
-	index += sizeof(frame_header_struct_t);
+	memcpy(&frame_receive_header_, frame, sizeof(io::FrameHeader));
+	index += sizeof(io::FrameHeader);
 	
-	if ((!Verify_CRC8_Check_Sum(frame, sizeof(frame_header_struct_t))) || (!Verify_CRC16_Check_Sum(frame, frame_receive_header_.data_length + 9)))
+	if (!Verify_CRC8_Check_Sum(frame, sizeof(io::FrameHeader)))
 	{
 		std::cout<<"CRC error!!"<<std::endl;
 		return 0;
@@ -117,9 +121,13 @@ uint16_t SerialMain::ReceiveDataSolve(uint8_t *frame)
 		// printf("id:%x\n", cmd_id);
 		switch (cmd_id)
 		{
-			case VISION_ID:
+			case io::VISION_ID:
 			{
-				memcpy(&vision_msg_, frame + index, sizeof(vision_t));
+				if (frame_receive_header_.data_length != sizeof(io::VisionData))
+				{
+					return 0;
+				}
+				memcpy(&vision_msg_, frame + index, sizeof(io::VisionData));
                 //---------------------serial_main  data------------
 //                std::cout<<"-----serial_main  data------"<<std::endl;
 //				std::cout<<"mode:"<<vision_msg_.mode<<std::endl;
@@ -134,8 +142,8 @@ uint16_t SerialMain::ReceiveDataSolve(uint8_t *frame)
 			default:
 				break;
 		}
-		index += frame_receive_header_.data_length + 2;
-		return index;
+		index += frame_receive_header_.data_length;
+		return index + sizeof(io::MsgEndInfo);
 	}
 }
 
@@ -143,24 +151,26 @@ uint16_t SerialMain::SenderPackSolve(uint8_t *data, uint16_t data_length,
 									 uint16_t cmd_id, uint8_t *send_buf)
 {
 	
-	uint8_t index = 0;
-	frame_send_header_.SOF = HEADER_SOF;
+	uint16_t index = 0;
+	frame_send_header_.sof = io::HEADER_SOF;
 	frame_send_header_.data_length = data_length;
-	frame_send_header_.seq++;
+	frame_send_header_.seq = seq_counter_++;
 	
-	Append_CRC8_Check_Sum((uint8_t *)&frame_send_header_, sizeof(frame_header_struct_t));
+	Append_CRC8_Check_Sum((uint8_t *)&frame_send_header_, sizeof(io::FrameHeader));
 	
-	memcpy(send_buf, &frame_send_header_, sizeof(frame_header_struct_t));//assign frame header
+	memcpy(send_buf, &frame_send_header_, sizeof(io::FrameHeader));//assign frame header
 	
-	index += sizeof(frame_header_struct_t);
+	index += sizeof(io::FrameHeader);
 	
 	memcpy(send_buf + index, &cmd_id, sizeof(uint16_t));//assign cmd
 	
 	index += sizeof(uint16_t);
 	
 	memcpy(send_buf + index, data, data_length);//assign data
+	index += data_length;
 	
-	Append_CRC16_Check_Sum(send_buf, data_length + 9);
-	
-	return data_length + 9;
+	io::MsgEndInfo end_info;
+	memcpy(send_buf + index, &end_info, sizeof(end_info));
+
+	return index + sizeof(end_info);
 }
