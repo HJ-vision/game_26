@@ -17,6 +17,7 @@
 
 #include "serial_device.h"
 #include <iostream>
+#include <cerrno>
 
 //namespace robomaster {
 SerialDevice::SerialDevice(std::string port_name,
@@ -54,20 +55,18 @@ bool SerialDevice::Init() {
 // 打开设备
 bool SerialDevice::OpenDevice() {
 
-#ifdef __arm__
-	serial_fd_ = open(port_name_.c_str(), O_RDWR | O_NONBLOCK);
-#elif __x86_64__
-	serial_fd_ = open(port_name_.c_str(), O_RDWR | O_NOCTTY);
-#else
-	serial_fd_ = open(port_name_.c_str(), O_RDWR | O_NOCTTY);
-#endif
-	
+	// 全平台统一非阻塞打开：read/write 绝不能把 ROS 回调（单线程 executor）卡死。
+	// 原来的 #ifdef __arm__ / #elif __x86_64__ 在 Jetson（aarch64）上一个都不命中，
+	// 走了 #else 的纯阻塞分支；配合 VMIN=18，电控遥测一停 read() 就无限阻塞，
+	// 整个串口节点冻结（Vision_data 断流 + 控制帧发不出去）。
+	serial_fd_ = open(port_name_.c_str(), O_RDWR | O_NOCTTY | O_NONBLOCK);
+
 	if (serial_fd_ < 0) {
 		std::cerr << "Cannot open device "
 				  << port_name_ << std::endl;
 		return false;
 	}
-	
+
 	return true;
 }
 
@@ -150,8 +149,10 @@ bool SerialDevice::ConfigDevice() {
 		new_termios_.c_cflag &= ~CSTOPB; //8N1 default config
 
 /* config waiting time & min number of char */
-	new_termios_.c_cc[VTIME] = 1;
-	new_termios_.c_cc[VMIN] = 18;
+	// VMIN=0/VTIME=0：读到多少算多少，没有数据立即返回。
+	// （原来是 VMIN=18，凑不够 18 字节就阻塞，遥测一停节点就冻死）
+	new_termios_.c_cc[VMIN] = 0;
+	new_termios_.c_cc[VTIME] = 0;
 	
 	/* using the raw data mode */
 	new_termios_.c_lflag &= ~(ICANON | ECHO | ECHOE | ISIG);
@@ -165,78 +166,56 @@ bool SerialDevice::ConfigDevice() {
 		std::cerr << "failed to activate serial configuration" << std::endl;
 		return false;
 	}
+
+	// Linux 的 tcsetattr（TCSETS ioctl）会把 fd 上的 O_NONBLOCK 标志清掉，
+	// 必须在配置完成后再加回来，否则上面 open 时的非阻塞就白开了
+	int fl = fcntl(serial_fd_, F_GETFL, 0);
+	if (fl >= 0) {
+		fcntl(serial_fd_, F_SETFL, fl | O_NONBLOCK);
+	}
 	return true;
-	
+
 }
 
 int SerialDevice::Read(uint8_t *buf, int len) {
-	int ret = -1;
-	
-	if (NULL == buf) {
-		return -1;
-	} else {
-		ret = read(serial_fd_, buf, len);
-		// std::cout<<"Read once length: "<<ret<<std::endl;
-		
-		while (ret == 0) {
-			std::cerr << "Connection closed, try to reconnect." << std::endl;
-			while (!Init()) {
-				usleep(500000);//check every 500 ms
-			}
-			std::cout << "Reconnect Success." << std::endl;
-			ret = read(serial_fd_, buf, len);
-		}
+	if (NULL == buf || len <= 0) {
+		return 0;
+	}
+
+	int ret = read(serial_fd_, buf, len);
+	if (ret > 0) {
 		return ret;
 	}
-}
-
-int SerialDevice::ReadUntil2(uint8_t *buf, uint8_t end1, uint8_t end2, uint8_t max_len) {
-	int ret = -1;
-	int flag = 0;
-	uint8_t *p = buf;
-	uint8_t i = 0;
-	if (NULL == buf) {
-		return -1;
-	} else {
-		while (flag == 0) {
-			ret = read(serial_fd_, p, 1);
-			
-			while (ret == 0) {
-				std::cerr << "Connection closed, try to reconnect." << std::endl;
-				while (!Init()) {
-					usleep(500000);//check every 500 ms
-				}
-				std::cout << "Reconnect Success." << std::endl;
-				ret = read(serial_fd_, p, 1);
-			}
-			
-			if (*p == end1) {
-//			printf("data:%x\n",*p);
-				p++;
-//			printf("data:%x\n",*p);
-				read(serial_fd_, p, 1);
-				if (*p == end2) {
-					flag = 0;
-//           std::cout<<"Read a msg:" <<std::endl;
-					tcflush(serial_fd_, TCIFLUSH);
-					return 1;
-				}
-			}
-			p++;
-			i++;
-			if (i >= max_len) {
-				flag = 0;
-				tcflush(serial_fd_, TCIFLUSH);
-				return 0;
-			}
-		}
-		
+	if (ret == 0) {
+		return 0;	// VMIN=0 模式：当前没有数据，不是断连
 	}
-	
+	if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) {
+		return 0;	// 非阻塞模式：没有数据，正常情况
+	}
+
+	// 真正的读错误（串口拔线等）：限频打印防止 100Hz 刷屏。
+	// 注意绝对不能在这里做阻塞重连——本函数跑在 ROS 回调里，
+	// 卡住它就是卡住整个单线程 executor（老代码的教训）。
+	static int err_count = 0;
+	if (++err_count % 100 == 1) {
+		std::cerr << "Serial read error: " << strerror(errno)
+				  << " (err_count=" << err_count << ")" << std::endl;
+	}
+	return -1;
 }
 
 // 发送数据函数
 int SerialDevice::Write(const uint8_t *buf, int len) {
-	return write(serial_fd_, buf, len);
+	int ret = write(serial_fd_, buf, len);
+	if (ret < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) {
+		// 非阻塞 write 遇到 EAGAIN（TX 缓冲满）时这帧被丢弃：
+		// 42 字节@15Hz 远填不满缓冲，只有下位机彻底失联才会发生，丢了也没用
+		static int err_count = 0;
+		if (++err_count % 100 == 1) {
+			std::cerr << "Serial write error: " << strerror(errno)
+					  << " (err_count=" << err_count << ")" << std::endl;
+		}
+	}
+	return ret;
 }
 //}
