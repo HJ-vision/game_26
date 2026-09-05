@@ -43,6 +43,8 @@ private:
       vision_t->mode = serial.vision_msg_.mode;
       vision_t->pitch = serial.vision_msg_.pitch;
       vision_t->yaw = serial.vision_msg_.yaw;
+      vision_t->yaw_vel = serial.vision_msg_.yaw_vel;
+      vision_t->pitch_vel = serial.vision_msg_.pitch_vel;
       vision_t->roll = serial.vision_msg_.roll;
 
       vision_t->quaternion.resize(4);
@@ -51,7 +53,9 @@ private:
         vision_t->quaternion[i] = serial.vision_msg_.quaternion[i];
       }
 
-      vision_t->shoot = serial.vision_msg_.shoot;
+      vision_t->shoot_speed = serial.vision_msg_.shoot_speed;
+      vision_t->bullet_count = serial.vision_msg_.bullet_count;
+      vision_t->game_progress = serial.vision_msg_.game_progress;
 
       publisher_->publish(*vision_t);
     }
