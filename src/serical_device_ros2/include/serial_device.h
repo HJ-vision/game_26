@@ -58,6 +58,8 @@ class SerialDevice{
    * @param len Send data length
    * @return < 0 if failed, else the send length
    */
+  int ReadUntil2(uint8_t *buf, uint8_t end1 , uint8_t end2,uint8_t max_len)  ;
+
   int Write(const uint8_t *buf, int len);               // 发送数据函数
 
 
