@@ -1,0 +1,206 @@
+enemy_color: "red"
+# enemy_color: "blue"
+
+#####-----神经网络参数-----#####
+# === 【提帧率方案】===
+# 推荐组合（按 ROI 600x600 实际输入算）：
+#   方案1（最快，不用换模型）：yolov5 + input_size=416 + use_traditional=false
+#          → 推理 FLOPs 降到 (416/640)²≈42%，预期 det 从 90ms→35~45ms，
+#          叠加省掉传统灯条矫正的 10~20ms，总耗时 ~45ms → 22Hz+
+#          精度影响：4 米内小装甲板识别基本不掉；5 米外可能漏 5~10%。
+#          如果发现识别率下降，先把 input_size 提到 480 试。
+#   方案2（换更轻模型）：yolo11 + input_size=416（注意要用 yolo11n/s 重新导出的
+#          对应分辨率 IR 模型，否则 Detect 头特征图尺寸不匹配会崩）。
+# yolo_name 可选：yolov5 / yolov8 / yolo11  （assets 里必须有对应 .xml/.bin）
+#
+# === 【方案 B：切换 yolo11 / nano 模型】===
+# 步骤：
+#   1) 先用上面方案 A（yolov5 + 416 + use_traditional=false）跑一遍记基线
+#      [PERF] total = ?ms ?Hz。
+#   2) 把下面三行改成：
+#        yolo_name: yolo11
+#        input_size: 416
+#        use_traditional: false
+#      yolo11_model_path 已经指向 assets/yolo11.xml，不用改。
+#   3) 重新编译 sp_vision_ros2 跑，和基线比 det + trk。
+#      如果识别率和 yolov5-416 差不多但帧率还更高 → 直接用 yolo11。
+#      如果识别率掉了 → 回退 yolov5-416。
+#
+# === 【方案 C：终极提速 —— 重新导出 yolov5n / yolo11n 的 IR 模型】===
+#   yolov5 分 n/s/m/l 四个尺寸：当前用的 yolov5.xml 很可能是 small（s）。
+#   nano（n）版本 FLOPs 是 small 的 ~1/3，Jetson NX CPU 推理 det 能从 40ms → 15ms，
+#   总帧率直奔 40~50Hz。代价是 mAP 掉 3~5 个点，5m 外小装甲板识别会吃点亏。
+#   操作流程（在有 GPU 的训练机上做）：
+#     a. 导出对应分辨率的 ONNX（yolov5n 或 yolo11n，--imgsz 416 或 480，
+#        强烈建议 --dynamic 或绑定静态 shape 都可以）
+#     b. 用 OpenVINO Model Optimizer 转 IR：
+#          mo --input_model bestn.onnx --input_shape [1,3,416,416] \
+#             --data_type FP16 --output_dir yolo11n_416/
+#     c. 把生成的 .xml + .bin 拷到 assets/，改 YAML 里 *_model_path 指向它
+#     d. input_size 设成和导出时一致（必须 32 对齐）
+#
+#   没有 GPU / 没时间重训？就用方案 A 的 yolov5-416，最稳。
+yolo_name: yolov5
+classify_model: assets/tiny_resnet.onnx
+yolo11_model_path: assets/yolo11.xml
+yolov8_model_path: assets/yolov8.xml
+yolov5_model_path: assets/yolov5.xml
+# === TensorRT GPU 后端（Jetson 专用，仅 yolo_name: yolov5 + device: GPU 时生效）===
+# 对应板上已构建好的 fp16 engine（trtexec 实测 GPU compute ~3.4ms，
+# 对比 CPU OpenVINO 35~85ms）。启动时加载缓存 engine（秒级）；
+# 仅当 engine 不存在 / 比 onnx 旧 / 反序列化失败时才自动调
+# /usr/src/tensorrt/bin/trtexec 重建（首次约 1~3 分钟）。
+# 注意：TRT 后端输入尺寸以 engine（onnx 导出形状）为准 = 640，
+#       input_size 保持 640 不要动。
+yolov5_trt_onnx_path: assets/0526.onnx
+yolov5_trt_engine_path: assets/yolov5_fp16.engine
+# Jetson Nano/NX 上 OpenVINO 只支持 CPU 推理（GPU plugin 与 ARM64 不兼容）。
+#   CPU = OpenVINO 推理（当前稳定基线）
+#   GPU = TensorRT 推理（yolov5 + 0526.onnx）
+# 切 GPU 前确认两件事：
+#   1) assets/ 里已有 0526.onnx 和 yolov5_fp16.engine
+#   2) colcon build 输出里看到 "TensorRT found"（若 NOT found 则编译期
+#      无 TRT，运行时会回退 CPU 并打 WARN，行为安全）
+device: CPU
+# 提高最低置信度：减少后处理 NMS 候选，省 1~3ms；同时过滤低置信假阳性。
+# 识别差时可回退到 0.55。
+min_confidence: 0.65
+# 【提速关键】关闭传统灯条二次矫正。
+# YOLO 已经输出四个角点，再跑一次轮廓检测+minAreaRect+颜色判断的矫正
+# 平均每张装甲板花 1~2ms，一帧 2~5 块就吃掉 5~10ms，且矫正后的角点与
+# YOLO 角点 RMSE <2px，对 solvePnP 精度提升 <0.1°。代价远大于收益。
+# 如果发现角点偏移/画面边缘畸变放大导致弹着点偏，再改回 true。
+use_traditional: false
+# 输入分辨率（正方形边长，必须 32 对齐）：320 / 416 / 480 / 640
+# 调参建议：先 416 跑，若 [PERF] det > 50ms 就降到 320；
+#          若识别率不够就升到 480（别直接回到 640，差近一倍耗时）。
+# 注意：如果模型是按固定形状导出的（YOLOv5 Detect 头写死 Reshape），
+# input_size 改动后必须 reshape。本代码 yolov5.cpp 里已有 model->reshape()，
+# 只要不是用了形状绑定（static shape）导出的 IR 一般都能跑；
+# 如果启动崩溃报 "dimension mismatch at Reshape"，就需要按新 input_size
+# 重新导出 onnx → mo 转 IR。
+input_size: 640
+
+#####-----ROI-----#####
+roi: 
+  x: 420
+  y: 50
+  width: 600
+  height: 600
+
+use_roi: false
+
+#####-----传统方法参数-----#####
+threshold: 150
+max_angle_error: 45 # degree
+min_lightbar_ratio: 1.5
+max_lightbar_ratio: 20
+min_lightbar_length: 8
+min_armor_ratio: 1
+max_armor_ratio: 5
+max_side_ratio: 1.5
+max_rectangular_error: 25 # degree
+
+#####-----tracker参数-----#####
+min_detect_count: 5
+# detecting 阶段允许连续漏检的帧数（超过才回 lost）
+detect_lost_tolerance: 10
+# tracking 阶段允许连续漏检的帧数（18Hz 下约 2.5 秒）
+max_temp_lost_count: 45
+outpost_max_temp_lost_count: 75
+# 跟踪阶段：观测与预测位置的最大允许距离（米）。
+# 只接受离预测位置最近的候选板，超过此距离拒绝本帧观测。
+# 静止靶 0.3~0.5 足够；旋转靶装甲板绕中心摆动+换板，建议 0.8~1.0
+max_update_jump: 0.8
+
+#####-----aimer参数-----#####
+yaw_offset: 1.25 # degree -2.5
+pitch_offset: 0.41 # degree
+comming_angle: 55 # degree
+leaving_angle: 20 # degree
+decision_speed: 7 # rad/s
+high_speed_delay_time: 0.0 # s
+low_speed_delay_time: 0.0 # s planner use this value
+# 【静止靶摆头修复】按目标速度缩放预测外推 horizon（实现见 aimer.cpp 注释）。
+# 完整外推 = 处理延迟 + 发弹延时 + 弹丸飞行时间（~0.3-0.4s），EKF 速度噪声
+# 会被它放大成瞄准点抖动，静止靶上表现为纯噪声驱动的左右摆头。
+# v_eff = 平移速度 + |vyaw|×旋转半径；外推时间 ×(v_eff/ref)²：
+#   v_eff ≥ ref → 完整外推（动态目标提前量不损失）
+#   v_eff ≈ 0   → 外推≈0（静止靶指令冻结在滤波位置）
+# 调小 ref → 更早恢复完整外推（动态更准，静止靶可能残留抖动）
+# 调大 ref → 静止靶更稳，慢速横移目标（<ref）提前量不足
+extrapolation_ref_speed: 0.5
+
+#####-----shooter参数-----#####
+first_tolerance: 3 # 近距离射击容差，degree
+second_tolerance: 2 # 远距离射击容差，degree
+judge_distance: 2 #距离判断阈值
+auto_fire: true # 是否由自瞄控制射击
+
+camera_name: "hikrobot"
+exposure_ms: 2.5
+gain: 16.9
+vid_pid: "2bdf:0001"
+
+# IMU 安装姿态：本机 IMU 相对云台绕 z 轴（yaw 轴）转了 +90°，
+# 云台 pitch 会出现在 IMU 四元数的 roll 通道里，需要共轭补偿。
+#
+# 【2026-09-03 修正】之前用的 Rz(-90°)=[0,1,0,-1,0,0,0,0,1] 方向反了：
+# 共轭方向取反的净效果 = Rz(180°) 共轭 → yaw 补偿正确（z 轴旋转可交换），
+# 但 pitch/roll 全部反号。实机数据实锤：云台俯仰 6.3° 时同一静止装甲板的
+# 世界系 z 漂移 0.839m ≈ 2×d×sin(θ)（反号模型预测 0.900m，缺失模型只有
+# 0.453m），xy 仅偏 6cm。静止时恒定误差被 EKF 吸收看不出问题，云台一动
+# 观测 z 就飞，自瞄正反馈"往天上跑"。
+R_gimbal2imubody: [0, -1, 0, 1, 0, 0, 0, 0, 1]
+# 回滚值（错误方向，勿用）: [0, 1, 0, -1, 0, 0, 0, 0, 1]
+# 其他备选: [1, 0, 0, 0, 1, 0, 0, 0, 1]
+
+# ===== 内参：已由 calibrationdata(1).tar.gz(ost.yaml) 重新标定（英雄8mm，1440x1080）=====
+# 注意：如果换"小头8mm"镜头，用被注释的那组参数（2395.48 / 2393.50 / cx 714.10 / cy 573.10）
+camera_matrix: [2402.24253, 0, 703.38615, 0, 2400.88544, 554.02488, 0, 0, 1]
+distort_coeffs: [-0.014951, 0.037365, -0.000092, 0.001019, 0.000000]
+
+# 小头8mm（备用，换镜头时启用）
+# camera_matrix: [2395.480340, 0, 714.096961, 0, 2393.500691, 573.103961, 0, 0, 1]
+# distort_coeffs: [-0.022111, 0.020275, -0.000261, 0.000434, 0]
+
+# ===== 外参：来自 C 项目实车 TF 标定（gimbal_pitch_r → camera_optical_frame） =====
+# TF 链: gimbal_pitch_r → camera_switch (t=[0.12, 0, 0.07], R=I)
+#         camera_switch → camera_optical_frame (t=[0,0,0], RPY=[-π/2, 0, -π/2])
+# 换算: R_camera2gimbal = 标准光轴→云台旋转, t = 相机光心在云台系坐标
+# 同济原车值（仅留档对照，勿用）：
+# R_camera2gimbal: [-0.027182119030230909, -0.12616154330853446, 0.99163723074269183, -0.99949106557517331, 0.019998323121329122, -0.024853106601381177, -0.016695575474690555, -0.99180811252093692, -0.12664093215554434]
+# t_camera2gimbal: [0.13160669975045827, 0.10377721766577375, 0.024908271912914642]
+R_camera2gimbal: [0, 0, 1, -1, 0, 0, 0, -1, 0]
+t_camera2gimbal: [0.12, 0.0, 0.07]
+
+#####-----cboard参数-----#####
+quaternion_canid: 0x100
+bullet_speed_canid: 0x101
+send_canid: 0xff
+can_interface: "can0"
+
+#####-----gimbal参数-----#####
+com_port: "/dev/gimbal"
+yaw_kp: 0
+yaw_kd: 0
+pitch_kp: 0
+pitch_kd: 0
+
+#####-----planner-----#####
+fire_thresh: 0.0035
+
+max_yaw_acc: 50
+Q_yaw: [9e6, 0]
+R_yaw: [1]
+
+max_pitch_acc: 100
+Q_pitch: [9e6, 0]
+R_pitch: [1]
+
+#####-----buff_detector参数-----#####
+model: "assets/yolo11_buff_int8.xml"
+
+#####-----buff_aimer参数-----#####
+fire_gap_time: 0.700   # s
+predict_time: 0.120     # s
